@@ -1,7 +1,32 @@
 import os
 import re
+import sys
 import pandas as pd
 
+
+def check_environment():
+    print("--- Kontrola prostredia ---")
+
+    # 1. Kontrola knižníc
+    try:
+        import openpyxl
+        print("[OK] Knižnice pandas a openpyxl sú dostupné.")
+    except ImportError:
+        print("[ERROR] Chýba knižnica 'openpyxl'. Nainštalujte ju: pip install openpyxl")
+        sys.exit(1)
+
+    # 2. Test zápisu v aktuálnom priečinku
+    test_file = 'write_test.tmp'
+    try:
+        with open(test_file, 'w') as f:
+            f.write('test')
+        os.remove(test_file)
+        print("[OK] Právo na zápis overené.")
+    except Exception as e:
+        print(f"[ERROR] Nemáte právo na zápis v tomto priečinku: {e}")
+        sys.exit(1)
+
+    print("---------------------------\n")
 
 def parse_dicom_dump(file_path):
     metadata = {}
@@ -78,11 +103,20 @@ def parse_dicom_dump(file_path):
 
 
 def process_all_imaging(root_path):
+    check_environment()
+
+    # Získame zoznam všetkých položiek, ktoré sú skutočne priečinkami
+    all_items = [f for f in os.listdir(root_path) if os.path.isdir(os.path.join(root_path, f))]
+    total_folders = len(all_items)
+
+    print(f"Nájdených {total_folders} zložiek na spracovanie.\n")
+
     study_level = []
     series_level = []
 
-    for accession in os.listdir(root_path):
+    for index, accession in enumerate(all_items, 1):
         folder = os.path.join(root_path, accession)
+        print(f"[{index}/{total_folders}] Analyzujem zložku: {accession}")
         if not os.path.isdir(folder): continue
 
         dumps = [f for f in os.listdir(folder) if f.endswith('.dump')]
@@ -93,7 +127,6 @@ def process_all_imaging(root_path):
                       'insts': set(), 'date': ""}
 
         for d in dumps:
-            print(f"Spracovávam: {accession} -> {d}")  # Toto pridajte
             data = parse_dicom_dump(os.path.join(folder, d))
             # Plnenie štúdie
             if data['modality'] != "N/A": study_info['modalities'].add(data['modality'])
@@ -159,12 +192,30 @@ def process_all_imaging(root_path):
 
             series_level.append(common)
 
-    # EXPORTY
-    pd.DataFrame(study_level).to_excel('ImagingStudy.xlsx', index=False)
-    df_s = pd.DataFrame(series_level)
-    for m in df_s['modality'].unique():
-        df_s[df_s['modality'] == m].dropna(axis=1, how='all').to_excel(f'Series_{m}.xlsx', index=False)
+        # EXPORTY
+        if study_level:
+            pd.DataFrame(study_level).to_excel('ImagingStudy.xlsx', index=False)
+
+        if series_level:
+            df_s = pd.DataFrame(series_level)
+            for m in df_s['modality'].unique():
+                if pd.isna(m) or m == "N/A": continue  # Preskočíme neidentifikované modality
+                df_s[df_s['modality'] == m].dropna(axis=1, how='all').to_excel(f'Series_{m}.xlsx', index=False)
+        else:
+            print("\n[UPOZORNENIE] Nenašli sa žiadne série na export.")
 
 
-# Spustenie
-process_all_imaging('./data')
+# --- SPUSTENIE SKRIPTU ---
+if __name__ == "__main__":
+    # Skontrolujeme, či používateľ zadal aspoň jeden argument (cestu)
+    # sys.argv[0] je vždy názov skriptu, sys.argv[1] je prvý argument za ním
+    if len(sys.argv) < 2:
+        print("\n[CHYBA] Nezadaná cesta k dátam!")
+        print(f"Použitie: python {os.path.basename(__file__)} \"C:\\cesta\\k\\datam\"")
+        sys.exit(1)
+
+    # Preberieme cestu z príkazového riadka
+    input_path = sys.argv[1]
+
+    # Spustíme analýzu s touto dynamickou cestou
+    process_all_imaging(input_path)
