@@ -1,6 +1,8 @@
 import os
 import re
 import sys
+import json
+import urllib.request
 import pandas as pd
 
 
@@ -28,6 +30,26 @@ def check_environment():
 
     print("---------------------------\n")
 
+
+def get_patient_id(accession_number):
+    """
+    Zistí ID pacienta pomocou HTTP požiadavky.
+    V lokálnom prostredí (kde server nie je dostupný) zlyhanie ošetrí a vráti prázdny reťazec.
+    """
+    url = f"http://172.16.55.182:8080/api/accession_numbers/{accession_number}/patient"
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'PythonScript'})
+        with urllib.request.urlopen(req, timeout=2) as response:
+            if response.status == 200:
+                data = json.loads(response.read().decode('utf-8'))
+                patient_id = data.get('ID')
+                if patient_id is not None:
+                    return str(patient_id)
+    except Exception:
+        pass
+    return ""
+
+
 def parse_dicom_dump(file_path):
     metadata = {}
     # Zoznam tagov pre všetky modality
@@ -47,7 +69,7 @@ def parse_dicom_dump(file_path):
         'depth': r'\(0028,0100\)(?:\s+\w+\s+)([^#\s\r\n]+)',  # Bits Allocated
         'channels': r'\(0028,0002\)(?:\s+\w+\s+)([^#\s\r\n]+)',  # Samples per Pixel
         'channel_res': r'\(0028,0101\)(?:\s+\w+\s+)([^#\s\r\n]+)',  # Bits Stored
-        'compression': r'\(0002,0010\)(?:\s+\w+\s+)([^#\s\r\n]+)',  # Transfer Syntax UID
+        'compression': r'\(0002,0010\).*?=\s*([^#\s\r\n]+)',  # Transfer Syntax UID (upravené pre správne vytiahnutie hodnoty)
         'annotations': r'\(0008,103e\).*?\[(.*?)\]',  # Series Description
 
         # Štúdia level tagy
@@ -84,7 +106,6 @@ def parse_dicom_dump(file_path):
         'coil': r'\(0018,1250\).*?\[(.*?)\]'  # Receive Coil Name
     }
 
-    # 1. Preddefinujeme slovník s predvolenými hodnotami
     metadata = {key: "N/A" for key in patterns.keys()}
     metadata['file_size'] = 0
 
@@ -105,7 +126,6 @@ def parse_dicom_dump(file_path):
 def process_all_imaging(root_path):
     check_environment()
 
-    # Získame zoznam všetkých položiek, ktoré sú skutočne priečinkami
     all_items = [f for f in os.listdir(root_path) if os.path.isdir(os.path.join(root_path, f))]
     total_folders = len(all_items)
 
@@ -115,17 +135,18 @@ def process_all_imaging(root_path):
         folder = os.path.join(root_path, accession)
         print(f"[{index}/{total_folders}] Analyzujem: {accession}")
 
+        clean_accession = accession.replace('#', '')
+        patient_id = get_patient_id(clean_accession)
+
         dumps = [f for f in os.listdir(folder) if f.endswith('.dump')]
         if not dumps: continue
 
         series_buckets = {}
-        study_info = {'modalities': set(), 'regions': set(), 'procs': set(), 'reasons': set(), 'uids': set(),
+        study_info = {'procs': set(), 'reasons': set(), 'uids': set(),
                       'insts': set(), 'date': ""}
 
         for d in dumps:
             data = parse_dicom_dump(os.path.join(folder, d))
-            if data['modality'] != "N/A": study_info['modalities'].add(data['modality'])
-            if data['body_region'] != "N/A": study_info['regions'].add(data['body_region'])
             if data['imaging_procedure'] != "N/A": study_info['procs'].add(data['imaging_procedure'])
             if data['reason'] != "N/A": study_info['reasons'].add(data['reason'])
             if data['series_id'] != "N/A": study_info['uids'].add(data['series_id'])
@@ -139,19 +160,16 @@ def process_all_imaging(root_path):
         # PRIEBEŽNÁ PRÍPRAVA A ZÁPIS IMAGING STUDY
         sd = study_info['date']
         study_row = {
-            'imaging study identifier': accession.replace('#', ''),
-            'belongs to person': "",
-            'modalities': ", ".join(sorted(study_info['modalities'])),
-            'body region': ", ".join(sorted(study_info['regions'])),
+            'imaging study identifier': clean_accession,
+            'belongs to person': patient_id,
+            'study date': f"{sd[6:8]}.{sd[4:6]}.{sd[0:4]}" if len(sd) == 8 else "N/A",
             'imaging procedure': ", ".join(sorted(study_info['procs'])),
             'reason for imaging procedure': ", ".join(sorted(study_info['reasons'])),
-            'study date': f"{sd[6:8]}.{sd[4:6]}.{sd[0:4]}" if len(sd) == 8 else "N/A",
             'dicom series count': len(study_info['uids']),
             'dicom images count': len(dumps),
             'affiliated institution': ", ".join(sorted(study_info['insts']))
         }
 
-        # zápis do CSV (mode='a' znamená pripísanie)
         pd.DataFrame([study_row]).to_csv(
             'ImagingStudy.csv',
             mode='a',
@@ -161,32 +179,32 @@ def process_all_imaging(root_path):
             encoding='utf-8-sig'
         )
 
-        # PRIEBEŽNÁ PRÍPRAVA A ZÁPIS SÉRII
+        # PRIEBEŽNÁ PRÍPRAVA A ZÁPIS SÉRII (upravené poradie a názvy stĺpcov)
         for sid, files in series_buckets.items():
             f = files[0]
             common = {
                 'ID serie': sid,
-                'modality': f['modality'],
-                'imaging study identifier': accession.replace('#', ''),
+                'belongs to imaging study': clean_accession,
                 'DICOM images count': len(files),
-                'Series date': f['series_date'],
-                'Body region': f['body_region'],
-                'Laterality': f['laterality'],
-                'Imaging device': f['device'],
-                'Manufacturer': f['manufacturer'],
-                'Software version': f['sw_version'],
-                'Color space': f['color_space'],
-                'Pixel spacing': f['pixel_spacing'],
-                'Image type': f['image_type'],
-                'File format': 'DICOM',
-                'File size': f['file_size'],
-                'Image width': f['width'],
-                'Image height': f['height'],
-                'Image depth': f['depth'],
-                'Number of channels': f['channels'],
-                'Channel resolution': f['channel_res'],
-                'Compression method': f['compression'],
-                'Annotations available': f['annotations']
+                'imaging modality': f['modality'],
+                'series date': f['series_date'],
+                'body region': f['body_region'],
+                'laterality': f['laterality'],
+                'imaging device': f['device'],
+                'manufacturer': f['manufacturer'],
+                'software version': f['sw_version'],
+                'color space': f['color_space'],
+                'pixel spacing': f['pixel_spacing'],
+                'image type': f['image_type'],
+                'file format': 'DICOM',
+                'file size': f['file_size'],
+                'image width': f['width'],
+                'image height': f['height'],
+                'image depth': f['depth'],
+                'number of channels': f['channels'],
+                'channel resolution': f['channel_res'],
+                'compression method': f['compression'],
+                'annotations available': f['annotations']
             }
 
             if f['modality'] == 'CT':
@@ -230,7 +248,6 @@ def process_all_imaging(root_path):
                     'Exposure Time (ms)': f['exposure_time']
                 })
 
-            # ZMENENÉ: Okamžitý zápis série do CSV (podľa modality)
             safe_m = str(f['modality']).replace('/', '_').replace('\\', '_')
             filename = f'Series_{safe_m}.csv'
             pd.DataFrame([common]).to_csv(
@@ -247,15 +264,10 @@ def process_all_imaging(root_path):
 
 # --- SPUSTENIE SKRIPTU ---
 if __name__ == "__main__":
-    # Skontrolujeme, či používateľ zadal aspoň jeden argument (cestu)
-    # sys.argv[0] je vždy názov skriptu, sys.argv[1] je prvý argument za ním
     if len(sys.argv) < 2:
         print("\n[CHYBA] Nezadaná cesta k dátam!")
         print(f"Použitie: python {os.path.basename(__file__)} \"C:\\cesta\\k\\datam\"")
         sys.exit(1)
 
-    # Preberieme cestu z príkazového riadka
     input_path = sys.argv[1]
-
-    # Spustíme analýzu s touto dynamickou cestou
     process_all_imaging(input_path)
